@@ -1,0 +1,670 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template that:
+  1) Creates a random 10-char secret in Secrets Manager.
+  2) Creates three additional secrets in Secrets Manager for JIRA_URL, JIRA_API_KEY_ARN, JIRA_USER_NAME.
+  3) Creates two DynamoDB tables (CUSTOMER_TABLE and INTERACTION_TABLE).
+  4) Creates a Jira Lambda function (with provided code) and integrates it with API Gateway.
+  5) Creates a Lambda authorizer that checks x-api-key against the secret.
+  6) Creates a REST API Gateway secured by the authorizer.
+  7) Downloads customer.json & interactions.json from a public S3 bucket, then loads them into DynamoDB.
+
+  Authored by: Justin Ossai (jossai@amazon.com)
+  Date: 2025-02-04
+
+Resources:
+
+  ################################################
+  # 1) Random 10-character secret in Secrets Manager
+  ################################################
+  Random10CharSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Tags:
+      - Key: Name
+        Value: 'genai-crm-agent-demo' 
+      Name: Random10CharSecret
+      Description: 'Auto-generated 10-character secret for x-api-key usage'
+      GenerateSecretString:
+        PasswordLength: 10
+        ExcludeUppercase: false
+        ExcludeLowercase: false
+        ExcludeNumbers: false
+        ExcludePunctuation: true
+        IncludeSpace: false
+
+  ################################################
+  # Additional Secrets for Jira
+  ################################################
+  JiraUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: JIRA_URL
+      Description: 'Jira URL'
+      SecretString: 'your-jira-url'  # Replace with actual JIRA URL, e.g. https://your-domain.atlassian.net/rest/api/2
+
+  JiraApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: JIRA_API_KEY_ARN
+      Description: 'Jira API Key'
+      SecretString: 'your-api-key'   # Replace with your actual JIRA API key or the ARN of the secret containing the key
+
+  JiraUserNameSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: JIRA_USER_NAME
+      Description: 'Jira Username'
+      SecretString: 'your-username'  # Replace with your actual JIRA username
+
+  ################################################
+  # DynamoDB Tables
+  ################################################
+  CustomerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CUSTOMER_TABLE
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+
+  InteractionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: INTERACTION_TABLE
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+        - AttributeName: date
+          KeyType: RANGE
+
+  ################################################
+  # 2) Lambda Authorizer
+  ################################################
+  AuthorizerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadSecretPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  AuthorizerLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: Random10CharSecret
+    Properties:
+      FunctionName: AuthorizerLambdaFunction
+      Role: !GetAtt AuthorizerLambdaExecutionRole.Arn
+      Handler: index.authorizer_handler
+      Runtime: python3.12
+      Timeout: 10
+      MemorySize: 1024
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:41
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def authorizer_handler(event, context):
+              # Grab the x-api-key from request
+              headers = event.get('headers', {})
+              api_key = headers.get('x-api-key', '')
+
+              secretsmanager = boto3.client('secretsmanager')
+              secret_value = secretsmanager.get_secret_value(SecretId='Random10CharSecret')
+              secret_string = secret_value['SecretString']
+
+              # Decide ALLOW or DENY
+              if api_key == secret_string:
+                  effect = "Allow"
+              else:
+                  effect = "Deny"
+
+              auth_response = {
+                  "principalId": "user",
+                  "policyDocument": {
+                      "Version": "2012-10-17",
+                      "Statement": [
+                          {
+                              "Action": "execute-api:Invoke",
+                              "Effect": effect,
+                              "Resource": event["methodArn"]
+                          }
+                      ]
+                  }
+              }
+              return auth_response
+
+  ################################################
+  # 3) Jira Lambda Function
+  ################################################
+  JiraLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: 
+                  - !GetAtt CustomerTable.Arn
+                  - !GetAtt InteractionTable.Arn
+                  - !Sub "${CustomerTable.Arn}/*"
+                  - !Sub "${InteractionTable.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  JiraLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AuthorizerLambdaFunction
+    Properties:
+      FunctionName: JiraLambdaFunction
+      Role: !GetAtt JiraLambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 1024
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:41
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import base64
+          import urllib.parse
+          import urllib.request
+          import datetime
+          from boto3.dynamodb.conditions import Key
+          from aws_lambda_powertools import Logger, Metrics, Tracer
+
+          logger = Logger()
+          metrics = Metrics()
+          tracer = Tracer()
+
+          region = os.environ["AWS_REGION"]
+          dynamodb = boto3.resource("dynamodb")
+
+          customer_table_name = "CUSTOMER_TABLE"
+          interaction_table_name = "INTERACTION_TABLE"
+
+
+          class CustomerService:
+              def __init__(self, customer_table_name, interaction_table_name):
+                  self.customer_table = dynamodb.Table(customer_table_name)
+                  self.interactions_table = dynamodb.Table(interaction_table_name)
+
+              @tracer.capture_method
+              def get_recent_customer_interactions(self, customer_id, count):
+                  try:
+                      response = self.interactions_table.query(
+                          ScanIndexForward=False,
+                          Limit=count,
+                          KeyConditionExpression=Key("customer_id").eq(customer_id),
+                          ProjectionExpression="#interaction_date,notes",
+                          ExpressionAttributeNames={"#interaction_date": "date"},
+                      )
+                      return response["Items"]
+                  except Exception as e:
+                      logger.error(f"Error getting recent customer interactions: {str(e)}")
+                      raise
+
+              @tracer.capture_method
+              def get_customer_details(self, customer_id, *args):
+                  try:
+                      response = self.customer_table.get_item(
+                          Key={"customer_id": customer_id},
+                          ProjectionExpression=",".join(map(str, args)),
+                      )
+                      return response.get("Item", None)
+                  except Exception as e:
+                      logger.error(f"Error getting customer details: {str(e)}")
+                      raise
+
+              @tracer.capture_method
+              def get_customer_overview(self, customer_id):
+                  try:
+                      response = self.get_customer_details(customer_id, "overview")
+                      if response:
+                          return response["overview"]
+                      else:
+                          return {}
+                  except Exception as e:
+                      logger.error(f"Error getting customer overview: {str(e)}")
+                      raise
+
+              @tracer.capture_method
+              def get_customer_preferences(self, customer_id):
+                  try:
+                      response = self.get_customer_details(
+                          customer_id, "meetingType", "timeofDay", "dayOfWeek"
+                      )
+                      return response
+                  except Exception as e:
+                      logger.error(f"Error getting customer preferences: {str(e)}")
+                      raise
+
+
+          class JiraInteraction:
+              def __init__(self):
+                  self.jira_url = get_secret('JIRA_URL')
+                  self.jira_api_key_arn = get_secret('JIRA_API_KEY_ARN')
+                  self.jira_username = get_secret('JIRA_USER_NAME')
+                  self.credentials = base64.b64encode(
+                      f"{self.jira_username}:{self.get_jira_api_key()}".encode("utf-8")
+                  ).decode("utf-8")
+                  # Set up the JIRA authentication header
+                  self.headers = {
+                      "Accept": "application/json",
+                      "Content-Type": "application/json",
+                      "Authorization": f"Basic {self.credentials}",
+                  }
+
+              def get_jira_api_key(self):
+                  try:
+                      secrets_manager = boto3.client("secretsmanager", region_name=region)
+                      secret = secrets_manager.get_secret_value(SecretId=self.jira_api_key_arn)
+                      return secret["SecretString"]
+                  except Exception as e:
+                      logger.error(f"Error retrieving Jira API key: {str(e)}")
+                      raise
+
+              @tracer.capture_method
+              def get_open_jira_issues(self, project_id: str) -> list:
+                  search_url = f"{self.jira_url}/search"
+                  query_params = urllib.parse.urlencode(
+                      {
+                          "jql": f"project={project_id} AND issuetype=Task AND status='In Progress' OR status='To Do' order by duedate"
+                      }
+                  )
+                  full_url = f"{search_url}?{query_params}"
+
+                  try:
+                      req = urllib.request.Request(full_url, headers=self.headers, method="GET")
+                      with urllib.request.urlopen(req) as response:
+                          response_data = response.read().decode("utf-8")
+                          response_json = json.loads(response_data)
+                          open_tasks = []
+                          for issue in response_json["issues"]:
+                              task = {
+                                  "issueKey": issue["key"],
+                                  "summary": issue["fields"]["summary"],
+                                  "status": issue["fields"]["status"]["name"],
+                                  "project": issue["fields"]["project"]["name"],
+                                  "duedate": issue["fields"]["duedate"],
+                                  "assignee": (
+                                      issue["fields"]["assignee"]["displayName"]
+                                      if issue["fields"]["assignee"]
+                                      else "None"
+                                  ),
+                              }
+                              open_tasks.append(task)
+                          return open_tasks
+                  except urllib.error.HTTPError as e:
+                      logger.info(f"Failed to get issues. HTTPError: {e.code} {e.reason}")
+                  except urllib.error.URLError as e:
+                      logger.info(f"Failed to get issues. URLError: {e.reason}")
+                  except json.JSONDecodeError:
+                      logger.info(f"Failed to decode response as JSON: {response_data}")
+                  except Exception:
+                      logger.info("Invalid Jira Configuration")
+                  return []
+
+              @tracer.capture_method
+              def update_jira_issue(self, issue_key: str, timeline_in_weeks: int) -> dict:
+                  update_url = f"{self.jira_url}/issue/{issue_key}"
+                  due_date = (
+                      datetime.datetime.now() + datetime.timedelta(weeks=timeline_in_weeks)
+                  ).strftime("%Y-%m-%d")
+                  update_payload = json.dumps({"fields": {"duedate": due_date}})
+
+                  try:
+                      update_req = urllib.request.Request(
+                          update_url,
+                          data=update_payload.encode(),
+                          headers=self.headers,
+                          method="PUT",
+                      )
+                      with urllib.request.urlopen(update_req) as update_response:
+                          update_data = update_response.read().decode("utf-8")
+                          return {"issueKey": issue_key, "newTimeline": timeline_in_weeks}
+                  except urllib.error.HTTPError as e:
+                      logger.info(f"Failed to update task {issue_key}. HTTPError: {e.code} {e.reason}")
+                  except urllib.error.URLError as e:
+                      logger.info(f"Failed to update task {issue_key}. URLError: {e.reason}")
+                  except json.JSONDecodeError:
+                      logger.info(f"Failed to decode response for task {issue_key}: {update_data}")
+                  except Exception:
+                      logger.info("Invalid Jira Configuration")
+                  return {}
+
+
+          def get_secret(secret_name):
+              """Retrieve secret from AWS Secrets Manager"""
+              session = boto3.session.Session()
+              client = session.client(
+                  service_name='secretsmanager'
+              )
+              
+              try:
+                  get_secret_value_response = client.get_secret_value(
+                      SecretId=secret_name
+                  )
+              except Exception as e:
+                  raise e
+              else:
+                  if 'SecretString' in get_secret_value_response:
+                      return get_secret_value_response['SecretString']
+
+
+          @tracer.capture_lambda_handler
+          def lambda_handler(event, _):
+              logger.info(event)
+
+              api_path = event["pathParameters"]['proxy']
+              customer_id = event["queryStringParameters"].get("customerId", None)
+              count = event["queryStringParameters"].get("count", None)
+              project_id = event["queryStringParameters"].get("projectId", None)
+              issue_key = event["queryStringParameters"].get("issueKey", None)
+
+              body_dict = {}
+              if "body" in event and event["body"]:
+                  body_dict = json.loads(event["body"])
+              timeline_in_weeks = body_dict.get("timelineInWeeks", None)
+
+              logger.info(
+                  f"Request from API gateway with path: {api_path} project_id: {project_id} customer: {customer_id} count: {count} issue_key: {issue_key}"
+              )
+
+              customer_service = CustomerService(customer_table_name, interaction_table_name)
+              jira_interaction = JiraInteraction()
+
+              response_code = 200
+              if api_path == "/listRecentInteractions":
+                  count = int(count)
+                  result = customer_service.get_recent_customer_interactions(customer_id, count)
+              elif api_path == "/getPreferences":
+                  result = customer_service.get_customer_preferences(customer_id)
+              elif api_path == "/companyOverview":
+                  result = customer_service.get_customer_overview(customer_id)
+              elif api_path == "/getOpenJiraIssues":
+                  result = jira_interaction.get_open_jira_issues(project_id)
+              elif api_path == "/updateJiraIssue":
+                  result = jira_interaction.update_jira_issue(issue_key, int(timeline_in_weeks))
+              else:
+                  response_code = 404
+                  result = f"Unrecognized api path: {api_path}"
+
+              response = {"statusCode": response_code, "body": json.dumps({"message": result})}
+              logger.info(response)
+              return response
+
+
+  ################################################
+  # 4) API Gateway (and related resources)
+  ################################################
+  JiraApi:
+    Type: AWS::ApiGateway::RestApi
+    DependsOn: JiraLambdaFunction
+    Properties:
+      Name: JiraApi
+
+  RootResource:
+    Type: AWS::ApiGateway::Resource
+    DependsOn: JiraApi
+    Properties:
+      RestApiId: !Ref JiraApi
+      ParentId: !GetAtt JiraApi.RootResourceId
+      PathPart: "v1"
+
+  ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    DependsOn: RootResource
+    Properties:
+      RestApiId: !Ref JiraApi
+      ParentId: !Ref RootResource
+      PathPart: "{proxy+}"
+
+  JiraApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    DependsOn:
+      - JiraApi
+      - AuthorizerLambdaFunction
+    Properties:
+      Name: MyLambdaAuthorizer
+      Type: REQUEST
+      RestApiId: !Ref JiraApi
+      IdentitySource: "method.request.header.x-api-key"
+      AuthorizerUri: 
+        Fn::Sub: 
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerLambdaFunction.Arn}/invocations
+      AuthorizerResultTtlInSeconds: 300
+
+  ProxyMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn:
+      - ProxyResource
+      - JiraApiAuthorizer
+      - JiraLambdaFunction
+    Properties:
+      RestApiId: !Ref JiraApi
+      ResourceId: !Ref ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref JiraApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JiraLambdaFunction.Arn}/invocations
+        RequestTemplates:
+          application/json: '{ "statusCode": "200" }'
+
+  # Permissions allowing API Gateway to invoke the Lambdas
+  JiraLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - JiraLambdaFunction
+      - JiraApi
+    Properties:
+      FunctionName: !GetAtt JiraLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${JiraApi}/*/*/*
+
+  AuthorizerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - AuthorizerLambdaFunction
+      - JiraApi
+    Properties:
+      FunctionName: !GetAtt AuthorizerLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${JiraApi}/*
+
+  MyDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ProxyMethod
+    Properties:
+      RestApiId: !Ref JiraApi
+      StageName: "dev"
+
+  ################################################
+  # 5) Data Loader Lambda + Custom Resource to load JSON into DynamoDB
+  ################################################
+  DataLoaderLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataLoaderPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: "arn:aws:s3:::aws-blogs-artifacts-public/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt CustomerTable.Arn
+                  - !GetAtt InteractionTable.Arn
+                  - !Sub "${CustomerTable.Arn}/*"
+                  - !Sub "${InteractionTable.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  DataLoaderLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - CustomerTable
+      - InteractionTable
+    Properties:
+      FunctionName: DataLoaderLambdaFunction
+      Role: !GetAtt DataLoaderLambdaExecutionRole.Arn
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 1024
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:41
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.vendored import requests  # If needed for cfnresponse (or switch to a direct ResponseURL approach)
+          import cfnresponse  # Provided by AWS at runtime
+
+          s3_client = boto3.client("s3")
+          dynamodb = boto3.resource("dynamodb")
+
+          CUSTOMER_JSON_KEY = "artifacts/ML-16929/genai-lab/customer.json"
+          INTERACTIONS_JSON_KEY = "artifacts/ML-16929/genai-lab/interactions.json"
+          S3_BUCKET = "aws-blogs-artifacts-public"
+
+          def load_data_into_table(table_name, items):
+              table = dynamodb.Table(table_name)
+              for item in items:
+                  table.put_item(Item=item)
+
+          def handler(event, context):
+              print("Received event:", event)
+              response_data = {}
+              try:
+                  request_type = event["RequestType"]
+
+                  if request_type == "Delete":
+                      # Nothing to clean up from DynamoDB, just succeed
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                      return
+
+                  if request_type in ["Create", "Update"]:
+                      # 1) Download 'customer.json'
+                      customer_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=CUSTOMER_JSON_KEY)
+                      customer_data = json.loads(customer_obj["Body"].read().decode("utf-8"))
+
+                      # 2) Download 'interactions.json'
+                      interaction_obj = s3_client.get_object(Bucket=S3_BUCKET, Key=INTERACTIONS_JSON_KEY)
+                      interaction_data = json.loads(interaction_obj["Body"].read().decode("utf-8"))
+
+                      # 3) Load into DynamoDB
+                      load_data_into_table("CUSTOMER_TABLE", customer_data)
+                      load_data_into_table("INTERACTION_TABLE", interaction_data)
+
+                      response_data["Message"] = "Data loaded successfully into DynamoDB."
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  else:
+                      # Unknown RequestType
+                      print(f"Unknown RequestType: {request_type}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+
+              except Exception as e:
+                  print("Error loading data:", str(e))
+                  response_data["Error"] = str(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+
+  DataLoaderCustomResource:
+    Type: Custom::LoadDynamoData
+    DependsOn:
+      - DataLoaderLambdaFunction
+      - CustomerTable
+      - InteractionTable
+    Properties:
+      ServiceToken: !GetAtt DataLoaderLambdaFunction.Arn
+
+Outputs:
+  ApiInvokeURL:
+    Description: "Invoke URL for the API"
+    Value: !Sub "https://${JiraApi}.execute-api.${AWS::Region}.amazonaws.com/dev/v1/"
